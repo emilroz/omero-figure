@@ -1280,7 +1280,8 @@ class FigureExport(object):
                 panel['scalebar']['show']):
             return
 
-        if not ('pixel_size_x' in panel and panel['pixel_size_x'] > 0):
+        if not ('pixel_size_x' in panel and panel['pixel_size_x'] is not None
+                and panel['pixel_size_x'] > 0):
             v = "Can't show scalebar - pixel_size_x is not defined for panel"
             logger.error(v)
             return
