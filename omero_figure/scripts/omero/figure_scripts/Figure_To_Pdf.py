@@ -64,6 +64,13 @@ except ImportError:
     reportlab_installed = False
     logger.error("Reportlab not installed.")
 
+try:
+    from pptx import Presentation
+    pptx_installed = True
+except ImportError:
+    pptx_installed = False
+    logger.error("python-pptx not installed.")
+
 DEFAULT_OFFSET = 0
 
 ORIGINAL_DIR = "1_originals"
