@@ -21,6 +21,8 @@ import logging
 import json
 import numpy
 import html
+import pprint
+import re
 
 from datetime import datetime
 import os
@@ -70,6 +72,9 @@ try:
 except ImportError:
     pptx_installed = False
     logger.error("python-pptx not installed.")
+
+# MM to EMU
+MM_EMU_CONVERSION = 36000
 
 DEFAULT_OFFSET = 0
 
@@ -2219,6 +2224,402 @@ class TiffExport(FigureExport):
         self.figure_canvas.save()
 
 
+class PptxTemplateExport(TiffExport):
+    """
+    Subclass to handle export of Figure as TIFFs, 1 per page.
+    We only need to overwrite methods that actually put content on
+    the TIFF instead of PDF.
+    """
+
+    LAYOUT_PREFIX = "omero.figure"
+
+    def __init__(self, conn, script_params, export_images=None):
+
+        super(PptxTemplateExport, self).__init__(
+            conn, script_params, export_images)
+
+        from omero.gateway import THISPATH
+        self.GATEWAYPATH = THISPATH
+
+        self.ns = "omero.web.figure.pptx"
+        self.mimetype = "application/pptx"
+
+        self.webclient_uri = script_params['Webclient_URI']
+
+    def get_figure_file_ext(self):
+        return "pptx"
+
+    def get_slide_layout_from_template(self, presentation, rows, columns):
+        self.template_layout = []
+        for layout in presentation.slide_layouts:
+            if layout.name.lower().startswith(self.LAYOUT_PREFIX):
+                panel_layout_pptx =  layout.name.lower().replace(
+                    "omero.figure.", "")
+                layout_rows = int(panel_layout_pptx.split("x")[0])
+                layout_columns = int(panel_layout_pptx.split("x")[1])
+                if layout_rows == rows and layout_columns == columns:
+                    print("Using layout: {}".format(layout.name))
+                    return layout
+        return None
+
+    def get_picture_placeholders(self, slide):
+        """
+        Placeholders are slightly broken in python-pptx.
+        For layout it always reports LayoutPlaceholder:
+          14, Picture Placeholder 14, <class 'pptx.shapes.placeholder.LayoutPlaceholder'>
+          15, Text Placeholder 18, <class 'pptx.shapes.placeholder.LayoutPlaceholder'>
+        For a slide created from the layout it's a miss and match:
+          14, Picture Placeholder 1, <class 'pptx.shapes.placeholder.PicturePlaceholder'>
+          15, Text Placeholder 2, <class 'pptx.shapes.placeholder.SlidePlaceholder'>
+        """
+        placeholders = []
+        for shape in slide.placeholders:
+            if "Picture Placeholder" in shape.name:
+                placeholders.append(shape)
+        return placeholders
+
+    def get_text_placeholders(self, slide):
+        """
+        See get_picture_placeholders for more details
+        """
+        placeholders = []
+        for shape in slide.placeholders:
+            if "Text Placeholder" in shape.name:
+                placeholders.append(shape)
+        return placeholders
+
+    def create_figure(self):
+        """
+        Creates a PPTX presentation.
+        """
+        if not pptx_installed:
+            raise ImportError(
+                "Need to install https://pypi.org/project/python-pptx/")
+        OMERODIR = os.getenv("OMERODIR")
+        template_path = os.path.join(
+            OMERODIR, 'lib/scripts/omero/figure_scripts/template.pptx')
+        if not os.path.exists(template_path):
+            raise ImportError(
+                "PPTX template missing. "
+                "Install template file in: "
+                "lib/scripts/omero/figure_scripts/template.pptx")
+        # Get slide layout
+        # All fixed for now - tricky to deal with it other wise
+        # Implementaion very specific for the moment
+        result = re.search(r"\[(\d+)x(\d+)\]", self.figure_name)
+        if result is None:
+            raise ImportError(
+                "Figure wasn't created from PPTX template, "
+                "cannot use PPTX as Export")
+        self.page_layout_rows = int(result.groups()[0])
+        self.page_layout_columns = int(result.groups()[1])
+        self.presentation = Presentation(template_path)
+        self.slide_layout = self.get_slide_layout_from_template(
+            self.presentation, self.page_layout_rows, self.page_layout_columns
+        )
+        if self.slide_layout is None:
+            raise ImportError(
+                "Slide layout for {}x{} configuration not found".format(
+                    self.page_layout_rows, self.page_layout_columns
+                ))
+        name = self.get_figure_file_name()
+        print("Creating figure: {}".format(name))
+        self.figure_canvas = canvas.Canvas(
+            name, pagesize=(self.page_width, self.page_height))
+
+    def save_page(self, page=None):
+        """
+        Save the current PIL image page as a TIFF and start a new
+        PIL image for the next page
+        """
+        pass
+
+    def save_figure(self):
+        self.presentation.save(self.get_figure_file_name())
+
+    def paste_image(self, pil_img, img_name, panel, page, dpi=None):
+        """ Add the PIL image to the current figure page """
+
+        x = panel['x']
+        y = panel['y']
+        width = panel['width']
+        height = panel['height']
+
+        # Handle page offsets
+        x = x - page['x']
+        y = y - page['y']
+        print("Image size {}".format((x, y, width, height)))
+        x = scale_to_export_dpi(x)
+        y = scale_to_export_dpi(y)
+        width = scale_to_export_dpi(width)
+        height = scale_to_export_dpi(height)
+
+        x = int(round(x))
+        y = int(round(y))
+        width = int(round(width))
+        height = int(round(height))
+
+        print("Image size scaled {}".format((x, y, width, height)))
+
+        # Save image BEFORE resampling
+        if self.export_images:
+            rs_name = os.path.join(self.zip_folder_name, RESAMPLED_DIR,
+                                   img_name)
+            pil_img.save(rs_name)
+
+        # Resize to our target size to match DPI of figure
+        pil_img = pil_img.resize((width, height), Image.BICUBIC)
+
+        if self.export_images:
+            img_name = os.path.join(self.zip_folder_name, FINAL_DIR, img_name)
+            pil_img.save(img_name)
+
+        # Now at full figure resolution - Good time to add shapes...
+        crop = self.get_crop_region(panel)
+        print("Image crop {}".format((x, y, width, height)))
+        ShapeToPilExport(pil_img, panel, crop)
+
+        width, height = pil_img.size
+        return pil_img
+
+    def draw_panel(self, panel, page, idx):
+        """
+        Gets the image from OMERO, processes (and saves) it then
+        calls self.paste_image() to add it to PDF or TIFF figure.
+        """
+        image_id = panel['imageId']
+        channels = panel['channels']
+        x = panel['x']
+        y = panel['y']
+
+        # Handle page offsets
+        x = x - page['x']
+        y = y - page['y']
+
+        image = self.conn.getObject("Image", image_id)
+        if image is None:
+            return None, None
+
+        try:
+            self.apply_rdefs(image, channels)
+
+            # create name to save image
+            original_name = image.getName()
+            img_name = os.path.basename(original_name)
+            img_name = "%s_%s.tiff" % (idx, img_name)
+
+            # get cropped image (saving original)
+            orig_name = None
+            if self.export_images:
+                orig_name = os.path.join(
+                    self.zip_folder_name, ORIGINAL_DIR, img_name)
+            pil_img = self.get_panel_image(image, panel, orig_name)
+        finally:
+            if image._re is not None:
+                image._re.close()
+
+        # for PDF export, we might have a target dpi
+        dpi = panel.get('min_export_dpi', None)
+
+        # Paste the panel to PDF or TIFF image
+        pil_img = self.paste_image(pil_img, img_name, panel, page, dpi)
+
+        return image, pil_img
+
+    def get_labels_text(self, panel):
+        labels = panel['labels']
+        labels_text = []
+        for label in labels:
+            labels_text.append(label['text'])
+        return "\n".join(labels_text)
+
+
+    def add_panels_to_page(self, panels_json, image_ids, page):
+        """ Add panels that are within the bounds of this page """
+
+        slide = self.presentation.slides.add_slide(self.slide_layout)
+        picture_placeholders = self.get_picture_placeholders(slide)
+        text_placeholders = self.get_text_placeholders(slide)
+
+        panel_pange_index = 0
+        for i, panel in enumerate(panels_json):
+
+            if not self.panel_is_on_page(panel, page):
+                continue
+
+            image_id = panel['imageId']
+            # draw_panel() creates PIL image then applies it to the page.
+            # For TIFF export, draw_panel() also adds shapes to the
+            # PIL image before pasting onto the page...
+            image, pil_img = self.draw_panel(panel, page, i)
+            
+            if image is None:
+                continue
+            if image.canAnnotate():
+                image_ids.add(image_id)
+            # ... but for PDF we have to add shapes to the whole PDF page
+            #self.add_rois(panel, page)  # This does nothing for TIFF export
+
+            # Finally, add scale bar and labels to the page
+            pil_img = self.draw_scalebar(
+                pil_img, panel, pil_img.size[0], pil_img.size[1], page)
+            #self.draw_labels(panel, page)
+
+            img = BytesIO()
+            pil_img.save(img, "TIFF")
+            img.seek(0)
+            image_uri = self.webclient_uri + "?show=image-{}".format(image_id)
+            print("Image URI: {}".format(image_uri))
+            placeholder = picture_placeholders[panel_pange_index]
+            placeholder = placeholder.insert_picture(img)
+            placeholder.click_action.hyperlink.address = image_uri
+            text_placeholders[panel_pange_index].text = self.get_labels_text(
+                panel)
+            panel_pange_index += 1
+
+    def draw_scalebar(self, pil_img, panel, region_width, region_height, page):
+        """
+        Add the scalebar to the page.
+        Here we calculate the position of scalebar but delegate
+        to self.draw_line() and self.draw_text() to actually place
+        the scalebar and label on PDF/TIFF
+        """
+        print("Image size: {}".format((region_width, region_height)))
+        x = 0
+        y = 0
+        width = panel['width']
+        height = panel['height']
+
+        if not ('scalebar' in panel and 'show' in panel['scalebar'] and
+                panel['scalebar']['show']):
+            return pil_img
+
+        if not ('pixel_size_x' in panel and panel['pixel_size_x'] is not None
+                and panel['pixel_size_x'] > 0):
+            v = "Can't show scalebar - pixel_size_x is not defined for panel"
+            logger.error(v)
+            return pil_img
+
+        sb = panel['scalebar']
+
+        spacer = 0.05 * max(height, width)
+
+        color = sb['color']
+        red = int(color[0:2], 16)
+        green = int(color[2:4], 16)
+        blue = int(color[4:6], 16)
+
+        position = 'position' in sb and sb['position'] or 'bottomright'
+        align = 'left'
+
+        if position == 'topleft':
+            lx = x + spacer
+            ly = y + spacer
+        elif position == 'topright':
+            lx = x + width - spacer
+            ly = y + spacer
+            align = "right"
+        elif position == 'bottomleft':
+            lx = x + spacer
+            ly = y + height - spacer
+        elif position == 'bottomright':
+            lx = x + width - spacer
+            ly = y + height - spacer
+            align = "right"
+
+        pixel_size_x = panel['pixel_size_x']
+
+        # If we previously calculated the zoom scale for big image rendering
+        # Use this again here to scale the pixel size
+        if 'zoom_level_scale' in panel:
+            scale = panel['zoom_level_scale']
+            pixel_size_x = pixel_size_x / scale
+
+        pixels_length = sb['length'] / pixel_size_x
+
+        scale_to_canvas = panel['width'] / float(region_width)
+        canvas_length = pixels_length * scale_to_canvas
+
+        pixel_unit = panel.get('pixel_size_x_unit')
+        # if older file doesn't have scalebar.unit, use pixel unit
+        scalebar_unit = sb.get('units', pixel_unit)
+        if pixel_unit in unit_symbols and scalebar_unit in unit_symbols:
+            convert_factor = (unit_symbols[scalebar_unit]['microns'] /
+                              unit_symbols[pixel_unit]['microns'])
+            canvas_length = convert_factor * canvas_length
+
+        canvas_length = int(round(canvas_length))
+        if align == 'left':
+            lx_end = lx + canvas_length
+        else:
+            lx_end = lx - canvas_length
+        pil_img = self.draw_line(
+            pil_img, lx, ly, lx_end, ly, 3, (red, green, blue))
+        if 'show_label' not in sb and not sb['show_label']:
+            return pil_img
+        # Draw label
+        symbol = u"\u00B5m"
+        if 'pixel_size_x_symbol' in panel:
+            symbol = panel['pixel_size_x_symbol']
+        if scalebar_unit and scalebar_unit in unit_symbols:
+            symbol = unit_symbols[scalebar_unit]['symbol']
+        label = "%s %s" % (sb['length'], symbol)
+        font_size = 10
+        try:
+            font_size = int(sb.get('font_size'))
+        except Exception:
+            pass
+        # For 'bottom' scalebar, put label above
+        if 'bottom' in position:
+            ly = ly - font_size
+        else:
+            ly = ly + 5
+        return self.draw_text(
+            pil_img, label, (lx + lx_end)/2, ly, font_size,
+            (red, green, blue), align="center")
+
+    def draw_line(self, pil_img, x, y, x2, y2, width, rgb):
+        """ Draw line on the current figure page """
+        draw = ImageDraw.Draw(pil_img)
+        print("Line size {}".format((x, y, x2, y2, width)))
+        x = scale_to_export_dpi(x)
+        y = scale_to_export_dpi(y)
+        x2 = scale_to_export_dpi(x2)
+        y2 = scale_to_export_dpi(y2)
+        width = scale_to_export_dpi(width)
+        print("Line size scaled {}".format((x, y, x2, y2, width)))
+        for l in range(width):
+            draw.line([(x, y), (x2, y2)], fill=rgb)
+            y += 1
+            y2 += 1
+        return pil_img
+
+    def draw_text(self, pil_img, text, x, y, fontsize, rgb, align="center"):
+        """ Add text to the current figure page """
+        x = scale_to_export_dpi(x)
+        y = y - 5       # seems to help, but would be nice to fix this!
+        y = scale_to_export_dpi(y)
+        fontsize = scale_to_export_dpi(fontsize)
+        if markdown_imported:
+            # convert markdown to html
+            text = markdown.markdown(text)
+
+        temp_label = self.draw_temp_label(text, fontsize, rgb)
+
+        if align == "vertical":
+            temp_label = temp_label.rotate(90, expand=True)
+            y = y - (temp_label.size[1]/2)
+        elif align == "center":
+            x = x - (temp_label.size[0] / 2)
+        elif align == "right":
+            x = x - temp_label.size[0]
+        x = int(round(x))
+        y = int(round(y))
+        # Use label as mask, so transparent part is not pasted
+        pil_img.paste(temp_label, (x, y), mask=temp_label)
+        return pil_img
+
+
 class OmeroExport(TiffExport):
 
     def __init__(self, conn, script_params):
@@ -2302,6 +2703,9 @@ def export_figure(conn, script_params):
         fig_export = FigureExport(conn, script_params)
     elif export_option == 'PDF_IMAGES':
         fig_export = FigureExport(conn, script_params, export_images=True)
+    elif export_option == 'PPTX':
+        fig_export = PptxTemplateExport(
+            conn, script_params, export_images=False)
     elif export_option == 'TIFF':
         fig_export = TiffExport(conn, script_params)
     elif export_option == 'TIFF_IMAGES':
@@ -2317,7 +2721,7 @@ def run_script():
     via the scripting service, passing the required parameters.
     """
 
-    export_options = [rstring('PDF'), rstring('PDF_IMAGES'),
+    export_options = [rstring('PDF'), rstring('PDF_IMAGES'), rstring('PPTX'),
                       rstring('TIFF'), rstring('TIFF_IMAGES'),
                       rstring('OMERO')]
 
